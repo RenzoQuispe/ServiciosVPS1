@@ -1,0 +1,9 @@
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+# Dependencias del script.py
+selenium>=4.15.0
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+openai>=1.0.0
+pydantic>=2.0.0
