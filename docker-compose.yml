@@ -1,0 +1,27 @@
+services:
+  codigobarras:
+    build:
+      context: ./CodigoBarras-a-Producto
+      dockerfile: Dockerfile
+    image: codigobarras-a-producto:latest
+    container_name: codigobarras
+    env_file: ./CodigoBarras-a-Producto/.env
+    ports:
+      - "3001:3000"
+    restart: unless-stopped
+
+  canvas-a-productos:
+    build:
+      context: ./Canvas-a-Productos
+      dockerfile: Dockerfile
+    image: canvas-a-productos:latest
+    container_name: canvas-a-productos
+    env_file: ./Canvas-a-Productos/.env
+    ports:
+      - "3002:3000"
+    volumes:
+      - canvas_output:/app/output
+    restart: unless-stopped
+
+volumes:
+  canvas_output:
