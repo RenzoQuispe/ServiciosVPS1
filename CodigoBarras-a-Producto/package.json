@@ -1,0 +1,20 @@
+{
+  "name": "codigobarras-a-producto",
+  "version": "1.0.0",
+  "description": "API de escaneo de código de barras a producto (cache DB + UPCitemDB + Google CSE)",
+  "type": "module",
+  "main": "script.js",
+  "scripts": {
+    "start": "node script.js",
+    "dev": "node --watch script.js"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "pg": "^8.11.3",
+    "zod": "^3.22.4"
+  }
+}
