@@ -412,7 +412,20 @@ class ProductExtract(BaseModel):
     descripcion: str = Field(default="")
     precio: str = Field(default="")
 
-def openai_page_detect(client: OpenAI, screenshot_path: str, model: str, max_retries: int = 3) -> ProductsPage:
+
+def _usage_from_response(resp) -> Dict[str, int]:
+    """Extrae input/output/total tokens del response de OpenAI (responses API)."""
+    u = getattr(resp, "usage", None)
+    if u is None:
+        return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    return {
+        "input_tokens": getattr(u, "input_tokens", 0) or 0,
+        "output_tokens": getattr(u, "output_tokens", 0) or 0,
+        "total_tokens": getattr(u, "total_tokens", 0) or 0,
+    }
+
+
+def openai_page_detect(client: OpenAI, screenshot_path: str, model: str, max_retries: int = 3) -> Tuple[ProductsPage, Dict[str, int]]:
     """
     VERSIÓN 3.0 ULTRA-PRECISA - No incluye texto lateral
     """
@@ -497,15 +510,15 @@ def openai_page_detect(client: OpenAI, screenshot_path: str, model: str, max_ret
                 ],
                 text_format=ProductsPage,
             )
-            return resp.output_parsed
+            return resp.output_parsed, _usage_from_response(resp)
         except Exception as e:
             last_err = e
             time.sleep(0.8 * attempt)
 
     print(f"[WARN] Pass1 failed for {screenshot_path}: {last_err}")
-    return ProductsPage()
+    return ProductsPage(), {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
-def openai_refine_crop(client: OpenAI, crop_path: str, model: str, max_retries: int = 3) -> ProductExtract:
+def openai_refine_crop(client: OpenAI, crop_path: str, model: str, max_retries: int = 3) -> Tuple[ProductExtract, Dict[str, int]]:
     data_url = image_to_data_url(crop_path)
 
     system = "Eres un extractor de producto desde una imagen de una tarjeta/crop. Devuelve SOLO el schema. No inventes."
@@ -528,13 +541,13 @@ def openai_refine_crop(client: OpenAI, crop_path: str, model: str, max_retries: 
                 ],
                 text_format=ProductExtract,
             )
-            return resp.output_parsed
+            return resp.output_parsed, _usage_from_response(resp)
         except Exception as e:
             last_err = e
             time.sleep(0.8 * attempt)
 
     print(f"[WARN] Pass2 failed for {crop_path}: {last_err}")
-    return ProductExtract()
+    return ProductExtract(), {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
 
 # =========================
@@ -799,7 +812,7 @@ def openai_enrich_crops_batch(
     crop_paths: List[str],
     crop_filenames: List[str],
     max_retries: int = 3
-) -> EnrichBatch:
+) -> Tuple[EnrichBatch, Dict[str, int]]:
     system = (
         "Eres un extractor y normalizador de productos en tarjetas (cards) de catálogo.\n"
         "Objetivo: MINIMIZAR NOMBRES DUPLICADOS cuando los productos cambian por alguna característica.\n\n"
@@ -851,7 +864,7 @@ def openai_enrich_crops_batch(
                     fixed.append(EnrichedItem(
                         imagen=fn, valid=False, nombre="", distintivo="", variante="", precio="", descripcion="", confidence=0.0
                     ))
-            return EnrichBatch(items=fixed)
+            return EnrichBatch(items=fixed), _usage_from_response(resp)
         except Exception as e:
             last_err = e
             time.sleep(0.8 * attempt)
@@ -860,7 +873,7 @@ def openai_enrich_crops_batch(
     return EnrichBatch(items=[
         EnrichedItem(imagen=fn, valid=False, nombre="", distintivo="", variante="", precio="", descripcion="", confidence=0.0)
         for fn in crop_filenames
-    ])
+    ]), {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
 
 # =========================
@@ -941,6 +954,7 @@ def process_screenshots_folder_openai(
 
     client = OpenAI()
     openai_calls = 0
+    usage_total: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
     files = [f for f in os.listdir(input_dir) if f.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))]
     files.sort()
@@ -961,8 +975,10 @@ def process_screenshots_folder_openai(
             print(f"[STOP] max_openai_calls alcanzado ({max_openai_calls}).")
             break
 
-        page = openai_page_detect(client, spath, model=model_page)
+        page, usage = openai_page_detect(client, spath, model=model_page)
         openai_calls += 1
+        for k in usage_total:
+            usage_total[k] += usage.get(k, 0)
 
         products: List[ProductDetected] = []
         for p in page.productos:
@@ -999,8 +1015,10 @@ def process_screenshots_folder_openai(
                     print(f"[STOP] max_openai_calls alcanzado ({max_openai_calls}) en two-pass.")
                 else:
                     refine_model = model_crop or model_page
-                    refined = openai_refine_crop(client, crop_path, model=refine_model)
+                    refined, usage = openai_refine_crop(client, crop_path, model=refine_model)
                     openai_calls += 1
+                    for k in usage_total:
+                        usage_total[k] += usage.get(k, 0)
                     did_pass2 = 1
 
                     r_nombre = norm_spaces(refined.nombre)
@@ -1038,12 +1056,14 @@ def process_screenshots_folder_openai(
     print(f"OK -> Recortes: {crops_dir}")
     print(f"Total productos (base): {len(rows)}")
     print(f"OpenAI calls (extract): {openai_calls}")
+    print(f"Tokens usados: input={usage_total['input_tokens']} output={usage_total['output_tokens']} total={usage_total['total_tokens']}")
 
     return {
         "csv_path": csv_path,
         "crops_dir": crops_dir,
         "openai_calls": openai_calls,
         "rows_count": len(rows),
+        "usage": dict(usage_total),
     }
 
 def process_url_to_csv_openai(
@@ -1159,7 +1179,7 @@ def enrich_from_out_dir(
         crop_paths = [c[1] for c in chunk]
         crop_fns = [c[2] for c in chunk]
 
-        batch = openai_enrich_crops_batch(
+        batch, _ = openai_enrich_crops_batch(
             client=client,
             model=model_enrich,
             crop_paths=crop_paths,

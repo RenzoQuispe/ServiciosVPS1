@@ -44,7 +44,7 @@ def run_extraction(job_id: str, url: str, max_pages: Optional[int], two_pass: bo
         use_smart_crop = os.environ.get("SMART_CROP", "").lower() in ("1", "true", "yes")
         smart_pad_rel = float(os.environ.get("PAD_REL", "0.02"))
         min_conf_keep = float(os.environ.get("MIN_CONF_KEEP", "0.25"))
-        process_url_to_csv_openai(
+        result = process_url_to_csv_openai(
             url=url,
             out_dir=out_dir,
             csv_name="productos.csv",
@@ -62,6 +62,13 @@ def run_extraction(job_id: str, url: str, max_pages: Optional[int], two_pass: bo
             JOBS[job_id]["status"] = "failed"
             JOBS[job_id]["error"] = "No se generó el CSV de productos."
             return
+
+        usage = result.get("usage") or {}
+        JOBS[job_id]["usage"] = usage
+        u_in = usage.get("input_tokens", 0)
+        u_out = usage.get("output_tokens", 0)
+        u_tot = usage.get("total_tokens", 0)
+        print(f"[OK] Procesamiento completado. Tokens: input={u_in} output={u_out} total={u_tot}")
 
         rows = read_csv_dicts(str(csv_path))
         crops_dir = Path(out_dir) / "crops"
@@ -127,6 +134,8 @@ def get_status(job_id: str):
             products.append(prod)
         out["products"] = products
         out["job_id"] = job_id  # Para que el backend construya /crops/{job_id}/{imagen}
+        if job.get("usage"):
+            out["usage"] = job["usage"]  # Tokens usados: input_tokens, output_tokens, total_tokens
 
     elif job["status"] == "failed":
         out["error"] = job.get("error", "Error desconocido")
