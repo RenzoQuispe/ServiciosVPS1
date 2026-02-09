@@ -1168,6 +1168,7 @@ def enrich_from_out_dir(
 
     enriched_rows: List[Dict] = []
     openai_calls = 0
+    usage_total: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
     seen_names: Dict[str, int] = {}
 
@@ -1179,13 +1180,15 @@ def enrich_from_out_dir(
         crop_paths = [c[1] for c in chunk]
         crop_fns = [c[2] for c in chunk]
 
-        batch, _ = openai_enrich_crops_batch(
+        batch, usage = openai_enrich_crops_batch(
             client=client,
             model=model_enrich,
             crop_paths=crop_paths,
             crop_filenames=crop_fns
         )
         openai_calls += 1
+        for k in usage_total:
+            usage_total[k] += usage.get(k, 0)
 
         for (orig, _, fn), it in zip(chunk, batch.items):
             base_nombre = norm_spaces(orig.get("Nombre", ""))
@@ -1295,11 +1298,13 @@ def enrich_from_out_dir(
     print(f"OK -> CSV enriquecido: {csv_out}")
     print(f"OpenAI calls (enrich): {openai_calls}/{max_calls}")
     print(f"Filas salida: {len(final_rows)}")
+    print(f"Tokens usados (enrich): input={usage_total['input_tokens']} output={usage_total['output_tokens']} total={usage_total['total_tokens']}")
 
     return {
         "csv_out": csv_out,
         "openai_calls": openai_calls,
         "rows_count": len(final_rows),
+        "usage": dict(usage_total),
     }
 
 

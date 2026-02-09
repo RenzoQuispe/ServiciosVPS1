@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 # Importar funciones del script existente
-from script import process_url_to_csv_openai, read_csv_dicts
+from script import process_url_to_csv_openai, enrich_from_out_dir, read_csv_dicts
 
 app = FastAPI(title="Canvas-a-Productos API", version="1.0.0")
 
@@ -41,9 +41,14 @@ def run_extraction(job_id: str, url: str, max_pages: Optional[int], two_pass: bo
 
         model_page = os.environ.get("OPENAI_MODEL_PAGE", "gpt-4o")
         model_crop = os.environ.get("OPENAI_MODEL_CROP") or model_page
+        model_enrich = os.environ.get("OPENAI_MODEL_ENRICH") or model_crop
         use_smart_crop = os.environ.get("SMART_CROP", "").lower() in ("1", "true", "yes")
         smart_pad_rel = float(os.environ.get("PAD_REL", "0.02"))
         min_conf_keep = float(os.environ.get("MIN_CONF_KEEP", "0.25"))
+        batch_size = int(os.environ.get("ENRICH_BATCH_SIZE", "6"))
+        max_enrich_calls = int(os.environ.get("ENRICH_MAX_CALLS", "50"))
+        enrich_dedupe = os.environ.get("ENRICH_DEDUPE", "").lower() in ("1", "true", "yes")
+
         result = process_url_to_csv_openai(
             url=url,
             out_dir=out_dir,
@@ -63,7 +68,28 @@ def run_extraction(job_id: str, url: str, max_pages: Optional[int], two_pass: bo
             JOBS[job_id]["error"] = "No se generó el CSV de productos."
             return
 
-        usage = result.get("usage") or {}
+        usage = dict(result.get("usage") or {})
+
+        if enrich:
+            try:
+                enrich_result = enrich_from_out_dir(
+                    out_dir=out_dir,
+                    csv_in_name="productos.csv",
+                    csv_out_name="productos_enriquecidos.csv",
+                    model_enrich=model_enrich,
+                    batch_size=batch_size,
+                    max_enrich_calls=max_enrich_calls,
+                    dedupe=enrich_dedupe,
+                )
+                enrich_usage = enrich_result.get("usage") or {}
+                for k in ("input_tokens", "output_tokens", "total_tokens"):
+                    usage[k] = usage.get(k, 0) + enrich_usage.get(k, 0)
+                csv_path = Path(out_dir) / "productos_enriquecidos.csv"
+            except Exception as e:
+                JOBS[job_id]["status"] = "failed"
+                JOBS[job_id]["error"] = f"Error en enriquecimiento: {e}"
+                return
+
         JOBS[job_id]["usage"] = usage
         u_in = usage.get("input_tokens", 0)
         u_out = usage.get("output_tokens", 0)
@@ -76,15 +102,17 @@ def run_extraction(job_id: str, url: str, max_pages: Optional[int], two_pass: bo
         products = []
         for r in rows:
             img_name = (r.get("Imagen") or "").strip()
-            # Ruta local para servir la imagen
             crop_path = crops_dir / img_name if img_name else None
-            products.append({
-                "nombre": r.get("Nombre", "").strip(),
-                "variante": r.get("Variante", "").strip(),
-                "precio": r.get("Precio", "").strip(),
+            prod = {
+                "nombre": (r.get("Nombre") or "").strip(),
+                "variante": (r.get("Variante") or "").strip(),
+                "precio": (r.get("Precio") or "").strip(),
                 "imagen": img_name,
                 "imagen_path": str(crop_path) if crop_path and crop_path.exists() else None,
-            })
+            }
+            if "Descripcion" in r:
+                prod["descripcion"] = (r.get("Descripcion") or "").strip()
+            products.append(prod)
 
         JOBS[job_id]["status"] = "completed"
         JOBS[job_id]["products"] = products
@@ -105,13 +133,17 @@ def start_extract(req: ExtractRequest, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())
     JOBS[job_id] = {"status": "pending", "url": req.url}
 
+    # Enrich activo por defecto si ENABLE_ENRICH=1|true|yes en el .env (p. ej. con docker compose)
+    enable_enrich_by_env = os.environ.get("ENABLE_ENRICH", "").lower() in ("1", "true", "yes")
+    enrich = req.enrich or enable_enrich_by_env
+
     background_tasks.add_task(
         run_extraction,
         job_id,
         req.url,
         req.max_pages,
         req.two_pass,
-        req.enrich,
+        enrich,
     )
 
     return {"job_id": job_id, "status": "pending"}
