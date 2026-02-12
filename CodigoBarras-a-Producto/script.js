@@ -28,6 +28,8 @@ const CFG = {
         url: process.env.SUPABASE_URL || "",
         serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || "",
         bucket: process.env.BARCODE_CACHE_BUCKET || "barcode-cache",
+        // Subcarpeta dentro del bucket (ej. "barcode" → bucket/models/barcode/xxx.png). Permite compartir bucket "models" con gs-whatsApp.
+        storagePrefix: process.env.BARCODE_CACHE_STORAGE_PREFIX || "barcode",
     },
     provider: {
         name: "llamada_barras",
@@ -109,14 +111,20 @@ async function downloadImageAndUploadToSupabase(imageUrl, barcode) {
 
         const contentType = res.headers["content-type"] || "image/jpeg";
         const ext = contentType.includes("png") ? "png" : contentType.includes("webp") ? "webp" : "jpg";
-        const path = `${String(barcode).slice(0, 20)}-${Date.now()}.${ext}`;
+        const fileName = `${String(barcode).slice(0, 20)}-${Date.now()}.${ext}`;
+        const path = CFG.supabase.storagePrefix ? CFG.supabase.storagePrefix + "/" + fileName : fileName;
 
         const { error } = await sb.storage.from(CFG.supabase.bucket).upload(path, buffer, {
             contentType,
             upsert: true,
         });
         if (error) {
-            console.warn("Supabase storage upload failed:", error.message);
+            const bucketNotFound = /bucket not found|Bucket not found/i.test(error.message);
+            if (bucketNotFound) {
+                console.warn("Supabase: bucket '" + CFG.supabase.bucket + "' no existe. Usando URL original de la imagen.");
+            } else {
+                console.warn("Supabase storage upload failed:", error.message);
+            }
             return null;
         }
         const { data } = sb.storage.from(CFG.supabase.bucket).getPublicUrl(path);
@@ -156,6 +164,78 @@ function safeParseJson(s) {
         return s ? JSON.parse(s) : {};
     } catch {
         return {};
+    }
+}
+
+// =======================
+// Traducción a español con OpenAI (nombre, descripción, categoría)
+// =======================
+
+async function translateProductToSpanish({ name, description, category }) {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+        return null;
+    }
+
+    const payload = {
+        model: "gpt-4o-mini",
+        messages: [
+            {
+                role: "system",
+                content:
+                    "Eres un asistente que traduce textos comerciales de productos del inglés al español neutro, pensado para tickets de supermercado y catálogos. Debes ser breve y claro.",
+            },
+            {
+                role: "user",
+                content:
+                    "Traduce al español neutro el siguiente producto. Devuelve SOLO un JSON válido sin texto adicional, con la forma " +
+                    '{"name_es":"...", "description_es":"...", "category_es":"..."}' +
+                    ". Usa descripciones cortas (máx 1–2 frases) y categorías generales (ej: 'Bebidas', 'Snacks', 'Limpieza', 'Higiene', 'Lácteos', 'Panadería', 'Otros').\n\n" +
+                    `Nombre (name): ${name || ""}\n` +
+                    `Descripción (description): ${description || ""}\n` +
+                    `Categoría original (category): ${category || ""}\n`,
+            },
+        ],
+        temperature: 0.3,
+    };
+
+    try {
+        const res = await fetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify(payload),
+        });
+
+        if (!res.ok) {
+            const txt = await res.text().catch(() => "");
+            console.warn("OpenAI translation error status:", res.status, txt);
+            return null;
+        }
+
+        const data = await res.json();
+        const content = data?.choices?.[0]?.message?.content || "";
+        if (!content) return null;
+
+        let jsonText = content.trim();
+        // Intentar recortar bloque JSON si viene rodeado de texto accidentalmente
+        const firstBrace = jsonText.indexOf("{");
+        const lastBrace = jsonText.lastIndexOf("}");
+        if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+            jsonText = jsonText.slice(firstBrace, lastBrace + 1);
+        }
+
+        const parsed = JSON.parse(jsonText);
+        return {
+            name_es: typeof parsed.name_es === "string" ? parsed.name_es.trim() : null,
+            description_es: typeof parsed.description_es === "string" ? parsed.description_es.trim() : null,
+            category_es: typeof parsed.category_es === "string" ? parsed.category_es.trim() : null,
+        };
+    } catch (e) {
+        console.warn("OpenAI translation failed:", e?.message || e);
+        return null;
     }
 }
 
@@ -416,9 +496,29 @@ app.post("/scan", async (req, res) => {
         }
 
         const normalized = normalizeUPCItem(items[0]);
-        const name = normalized.name || [normalized.brand, normalized.model].filter(Boolean).join(" ") || "Sin nombre";
-        const description = (normalized.specs && typeof normalized.specs.description === "string") ? normalized.specs.description : (normalized.name || "");
+        let name = normalized.name || [normalized.brand, normalized.model].filter(Boolean).join(" ") || "Sin nombre";
+        let description =
+            normalized.specs && typeof normalized.specs.description === "string"
+                ? normalized.specs.description
+                : normalized.name || "";
+        let categoryRaw = normalized.category && String(normalized.category).trim() ? String(normalized.category).trim() : "OTROS";
         let image_url = normalized.image_url;
+
+        // 2.1) Traducir a español y normalizar categoría usando OpenAI (si hay API key)
+        try {
+            const translated = await translateProductToSpanish({
+                name,
+                description,
+                category: categoryRaw,
+            });
+            if (translated) {
+                if (translated.name_es) name = translated.name_es;
+                if (translated.description_es) description = translated.description_es;
+                if (translated.category_es) categoryRaw = translated.category_es.toUpperCase();
+            }
+        } catch (e) {
+            console.warn("No se pudo traducir con OpenAI, usando texto original:", e?.message || e);
+        }
 
         // 3) Si no hay imagen del proveedor, intentar Google CSE
         if (!image_url) {
@@ -441,7 +541,7 @@ app.post("/scan", async (req, res) => {
             if (supabaseUrl) finalImageUrl = supabaseUrl;
         }
 
-        const category = (normalized.category && String(normalized.category).trim()) ? String(normalized.category).trim() : "OTROS";
+        const category = categoryRaw || "OTROS";
 
         // 5) Guardar en cache (una sola tabla)
         await upsertCache(barcode, {
@@ -450,6 +550,12 @@ app.post("/scan", async (req, res) => {
             image_url: finalImageUrl,
             category,
         });
+
+        // Incluir descripción traducida en specs para que el backend (fromBarcode) la guarde en la tabla products
+        const specsWithTranslatedDescription = {
+            ...normalized.specs,
+            description: description || (normalized.specs && normalized.specs.description) || null,
+        };
 
         return res.json({
             barcode,
@@ -462,7 +568,7 @@ app.post("/scan", async (req, res) => {
                 model: normalized.model,
                 category,
                 image_url: finalImageUrl,
-                specs: normalized.specs,
+                specs: specsWithTranslatedDescription,
             },
         });
     } catch (err) {
