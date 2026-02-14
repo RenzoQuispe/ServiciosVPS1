@@ -19,9 +19,12 @@ import csv
 import time
 import base64
 import math
+import json
 import argparse
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 import cv2
 import numpy as np
@@ -76,6 +79,73 @@ def image_to_data_url(path: str) -> str:
 def file_suffix(fn: str) -> str:
     m = re.search(r"(\d+)", fn)
     return m.group(1) if m else fn
+
+
+# Prompt para mejora de crop (mismo criterio que "Mejorar imagen con IA" en gs-frontend, sin contexto de negocio)
+_IMPROVE_CROP_PROMPT = """
+Eres un experto en edición de imágenes para comercio electrónico.
+La imagen es un recorte de un catálogo. Transformala en una foto de producto profesional para tienda virtual.
+OBJETIVO: Solo el producto visible, fondo limpio y profesional (blanco o degradado suave), iluminación tipo softbox,
+colores reales, nitidez, sin texto ni precios de tarjeta. No agregar elementos que no existan.
+Salida: una sola imagen PNG, estilo catálogo, lista para e-commerce.
+""".strip()
+
+
+def _call_gemini_image(base64_image: str, prompt: str, api_key: str) -> Optional[bytes]:
+    """Llama a la API de Gemini (modelo imagen) igual que Nano Banana en gs-whatsApp. Devuelve PNG en bytes o None."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key={api_key}"
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"inline_data": {"mime_type": "image/png", "data": base64_image}},
+                    {"text": prompt},
+                ]
+            }
+        ],
+        "generationConfig": {
+            "responseModalities": ["IMAGE"],
+            "imageConfig": {"aspectRatio": "1:1"},
+        },
+    }
+    try:
+        body = json.dumps(payload).encode("utf-8")
+        req = Request(url, data=body, method="POST", headers={"Content-Type": "application/json"})
+        timeout = int(os.environ.get("IMPROVE_IMAGE_TIMEOUT_SEC", "300"))
+        with urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+        candidate = (data.get("candidates") or [None])[0]
+        if not candidate or not candidate.get("content") or not candidate["content"].get("parts"):
+            return None
+        part = candidate["content"]["parts"][0]
+        if "inlineData" not in part or "data" not in part["inlineData"]:
+            return None
+        return base64.b64decode(part["inlineData"]["data"])
+    except Exception:
+        return None
+
+
+def improve_crop_via_backend(crop_path: str) -> None:
+    """
+    Mejora el crop con IA (Gemini) directamente en el VPS — mismo flujo que "Mejorar imagen con IA" del frontend.
+    Si GEMINI_API_KEY (o NANO_BANANA_API_KEY) no está definido, no hace nada.
+    Para desactivar: comenta la única línea que llama a esta función en process_screenshots_folder_openai.
+    """
+    api_key = (
+        os.environ.get("GEMINI_API_KEY") or os.environ.get("NANO_BANANA_API_KEY") or ""
+    ).strip()
+    if not api_key:
+        return
+    try:
+        with open(crop_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+        out_bytes = _call_gemini_image(b64, _IMPROVE_CROP_PROMPT, api_key)
+        if out_bytes:
+            with open(crop_path, "wb") as f:
+                f.write(out_bytes)
+    except (ValueError, OSError) as e:
+        print(f"[WARN] Mejora de crop omitida para {crop_path}: {e}")
+
 
 def laplacian_sharpness(bgr: np.ndarray) -> float:
     if bgr is None or bgr.size == 0:
@@ -780,6 +850,7 @@ class CsvRow:
     imagen: str
     confianza: float
     pass2: int
+    descripcion: str = ""
 
 def needs_pass2(p: ProductDetected, min_conf_two_pass: float, require_fields: bool = True) -> bool:
     if float(p.confianza) < min_conf_two_pass:
@@ -787,6 +858,61 @@ def needs_pass2(p: ProductDetected, min_conf_two_pass: float, require_fields: bo
     if require_fields and (not norm_spaces(p.nombre) or not norm_spaces(p.precio)):
         return True
     return False
+
+
+# =========================
+# Mejora de descripciones (batch, modelo barato)
+# =========================
+
+def openai_descriptions_batch(
+    client: OpenAI,
+    items: List[Tuple[str, str]],
+    model: str = "gpt-4o-mini",
+    max_retries: int = 2,
+) -> List[str]:
+    """
+    Dado una lista de (nombre, variante), devuelve una lista de descripciones cortas tipo e-commerce.
+    Una sola llamada para todos = bajo costo. items sin nombre se devuelven como "".
+    """
+    if not items:
+        return []
+    lines = []
+    for nombre, variante in items:
+        nombre = (nombre or "").strip()
+        variante = (variante or "").strip()
+        if nombre:
+            lines.append(f"{nombre}" + (f" | {variante}" if variante else ""))
+        else:
+            lines.append("")
+
+    prompt = (
+        "Lista de productos (nombre o nombre | variante). "
+        "Para cada línea escribe UNA sola frase corta en español, atractiva para tienda online (máx 15 palabras). "
+        "Sin repetir el nombre literalmente. Sin numerar. Devuelve SOLO las frases, una por línea, mismo orden.\n\n"
+        + "\n".join(lines)
+    )
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "Eres un redactor de descripciones para e-commerce. Responde solo con el texto solicitado, una línea por producto."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=1024,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            out = [norm_spaces(line) for line in text.split("\n") if line.strip()]
+            if len(out) >= len(items):
+                return out[: len(items)]
+            out.extend([""] * (len(items) - len(out)))
+            return out
+        except Exception as e:
+            last_err = e
+            time.sleep(0.5 * attempt)
+    print(f"[WARN] Batch descripciones falló: {last_err}")
+    return [""] * len(items)
 
 
 # =========================
@@ -1003,12 +1129,14 @@ def process_screenshots_folder_openai(
             crop_name = f"prod_{crop_idx:04d}.png"
             crop_path = os.path.join(crops_dir, crop_name)
             cv2.imwrite(crop_path, crop)
+            improve_crop_via_backend(crop_path)  # ← Comentar esta línea para desactivar la mejora con IA
 
             nombre = norm_spaces(p.nombre)
             variante = norm_spaces(p.variante)
             precio = norm_price(p.precio)
             conf = float(p.confianza)
             did_pass2 = 0
+            descripcion = ""
 
             if two_pass and needs_pass2(p, min_conf_two_pass=min_conf_two_pass, require_fields=True):
                 if max_openai_calls and openai_calls >= max_openai_calls:
@@ -1024,6 +1152,7 @@ def process_screenshots_folder_openai(
                     r_nombre = norm_spaces(refined.nombre)
                     r_var = norm_spaces(refined.variante)
                     r_precio = norm_price(refined.precio)
+                    r_desc = norm_spaces(refined.descripcion)
 
                     if r_nombre:
                         nombre = r_nombre
@@ -1031,6 +1160,8 @@ def process_screenshots_folder_openai(
                         variante = r_var
                     if r_precio:
                         precio = r_precio
+                    if r_desc:
+                        descripcion = r_desc
 
             rows.append(CsvRow(
                 pagina=fname,
@@ -1039,18 +1170,32 @@ def process_screenshots_folder_openai(
                 precio=precio,
                 imagen=crop_name,
                 confianza=conf,
-                pass2=did_pass2
+                pass2=did_pass2,
+                descripcion=descripcion
             ))
             crop_idx += 1
 
         print(f"[OK] {fname}: detectados={len(page.productos)} usados={len(products)}")
 
+    # Opcional: rellenar descripciones vacías con texto tipo e-commerce (modelo barato, 1 llamada batch)
+    improve_descriptions = os.environ.get("ENABLE_IMPROVE_DESCRIPTIONS", "").lower() in ("1", "true", "yes")
+    if improve_descriptions and rows:
+        need_desc = [(i, r) for i, r in enumerate(rows) if not norm_spaces(r.descripcion)]
+        if need_desc:
+            model_desc = os.environ.get("OPENAI_MODEL_DESCRIPTIONS", "gpt-4o-mini").strip() or "gpt-4o-mini"
+            items = [(r.nombre, r.variante) for _, r in need_desc]
+            descriptions = openai_descriptions_batch(client, items, model=model_desc)
+            for (idx, _), desc in zip(need_desc, descriptions):
+                if desc:
+                    rows[idx].descripcion = desc
+            print(f"[OK] Descripciones mejoradas: {len(need_desc)} productos (modelo {model_desc})")
+
     csv_path = os.path.join(out_dir, csv_name)
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         wr = csv.writer(f)
-        wr.writerow(["Pagina", "Nombre", "Variante", "Precio", "Imagen", "Confianza", "TwoPass"])
+        wr.writerow(["Pagina", "Nombre", "Variante", "Precio", "Imagen", "Confianza", "TwoPass", "Descripcion"])
         for r in rows:
-            wr.writerow([r.pagina, r.nombre, r.variante, r.precio, r.imagen, f"{r.confianza:.2f}", r.pass2])
+            wr.writerow([r.pagina, r.nombre, r.variante, r.precio, r.imagen, f"{r.confianza:.2f}", r.pass2, r.descripcion])
 
     print(f"\nOK -> CSV base: {csv_path}")
     print(f"OK -> Recortes: {crops_dir}")
