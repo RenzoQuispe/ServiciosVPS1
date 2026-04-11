@@ -1129,7 +1129,9 @@ def process_screenshots_folder_openai(
             crop_name = f"prod_{crop_idx:04d}.png"
             crop_path = os.path.join(crops_dir, crop_name)
             cv2.imwrite(crop_path, crop)
-            improve_crop_via_backend(crop_path)  # ← Comentar esta línea para desactivar la mejora con IA
+            # Mejora con IA solo para los primeros 10 productos
+            if crop_idx <= 10:
+                improve_crop_via_backend(crop_path)  # ← Comentar esta línea para desactivar la mejora con IA
 
             nombre = norm_spaces(p.nombre)
             variante = norm_spaces(p.variante)
