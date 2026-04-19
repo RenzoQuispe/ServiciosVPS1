@@ -23,5 +23,16 @@ services:
       - canvas_output:/app/output
     restart: unless-stopped
 
+  extraer-info-anuncios:
+    build:
+      context: ./Extraer-Info-para-Anuncios
+      dockerfile: Dockerfile
+    image: extraer-info-anuncios:latest
+    container_name: extraer-info-anuncios
+    env_file: ./Extraer-Info-para-Anuncios/.env
+    ports:
+      - "127.0.0.1:3003:3000"
+    restart: unless-stopped
+
 volumes:
   canvas_output:
