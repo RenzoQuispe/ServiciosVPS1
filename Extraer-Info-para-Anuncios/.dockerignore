@@ -1,0 +1,6 @@
+__pycache__
+*.pyc
+.env
+.git
+amazon_product_export
+scan_product.py
