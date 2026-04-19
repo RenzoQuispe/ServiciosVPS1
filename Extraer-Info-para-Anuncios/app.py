@@ -8,12 +8,18 @@ import asyncio
 import json
 import os
 import logging
+from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 from scrapers import search_mercadolibre, search_amazon, search_alibaba
+
+# Cargar variables de entorno desde .env
+_env_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(_env_path)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -129,7 +135,7 @@ async def _scrape_product(product_id: int, product_name: str) -> dict:
     raw_videos: list[dict] = []
     raw_texts: list[dict] = []
 
-    for source_name, res in [("mercadolibre", ml_res), ("amazon", amz_res), ("alibaba", ali_res)]:
+    for source_name, res in [("falabella", ml_res), ("amazon", amz_res), ("amazon_mx", ali_res)]:
         if isinstance(res, Exception):
             logger.warning("Error scraping %s for '%s': %s", source_name, product_name, res)
             continue
@@ -165,6 +171,13 @@ async def _scrape_product(product_id: int, product_name: str) -> dict:
     images = _dedup_by_key(raw_images, key="url", limit=MAX_PER_PRODUCT)
     videos = _dedup_by_key(raw_videos, key="url", limit=MAX_PER_PRODUCT)
     texts = _dedup_by_key(raw_texts, key="title", limit=MAX_PER_PRODUCT)
+
+    logger.info(
+        "Scrape results for product %d (%s): %d images, %d videos, %d texts (raw: %d/%d/%d)",
+        product_id, product_name,
+        len(images), len(videos), len(texts),
+        len(raw_images), len(raw_videos), len(raw_texts),
+    )
 
     return {"images": images, "videos": videos, "texts": texts}
 

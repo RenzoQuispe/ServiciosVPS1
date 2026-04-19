@@ -1,20 +1,34 @@
-"""Scraper de resultados de búsqueda de Amazon."""
+"""Scraper de resultados de búsqueda de Amazon (.com y .com.mx)."""
 
 import re
+import logging
 import httpx
 from bs4 import BeautifulSoup
 
-_SEARCH_URL = "https://www.amazon.com/s"
+logger = logging.getLogger(__name__)
+
+_SEARCH_URLS = [
+    "https://www.amazon.com/s",
+    "https://www.amazon.com.mx/s",
+]
 
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "Chrome/126.0.6478.127 Safari/537.36"
     ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Encoding": "gzip, deflate, br",
+    "sec-ch-ua": '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "none",
+    "sec-fetch-user": "?1",
+    "upgrade-insecure-requests": "1",
 }
 
 
@@ -27,7 +41,6 @@ def _clean(text: str | None) -> str:
 def _normalize_image(url: str) -> str:
     """Convierte thumbnail de Amazon a alta resolución."""
     url = url.strip().split("?")[0]
-    # Remover sufijos de tamaño como ._AC_UL320_.jpg
     url = re.sub(r"\._[^./]+_\.", ".", url)
     return url
 
@@ -41,20 +54,25 @@ def _is_product_image(url: str) -> bool:
     return "images" in low or "m.media-amazon" in low
 
 
-def _extract_result(el: BeautifulSoup) -> dict | None:
+def _extract_result(el: BeautifulSoup, base_domain: str) -> dict | None:
     """Extrae datos de un resultado de búsqueda de Amazon."""
-    # Título
     title_el = el.select_one("h2 a span") or el.select_one("h2 span")
     title = _clean(title_el.get_text()) if title_el else ""
     if not title:
         return None
 
-    # URL
+    # URL: intentar h2 a, luego links con /dp/, luego construir desde data-asin
     link = el.select_one("h2 a")
     href = link.get("href", "") if link else ""
-    url = f"https://www.amazon.com{href}" if href.startswith("/") else href
+    if not href:
+        dp_link = el.select_one('a[href*="/dp/"]')
+        href = dp_link.get("href", "") if dp_link else ""
+    if not href:
+        asin = el.get("data-asin", "")
+        if asin:
+            href = f"/dp/{asin}"
+    url = f"{base_domain}{href}" if href.startswith("/") else href
 
-    # Precio
     price_whole = el.select_one("span.a-price-whole")
     price_frac = el.select_one("span.a-price-fraction")
     price = ""
@@ -63,7 +81,6 @@ def _extract_result(el: BeautifulSoup) -> dict | None:
         frac = _clean(price_frac.get_text()) if price_frac else "00"
         price = f"US${whole}.{frac}"
 
-    # Imagen
     img = el.select_one("img.s-image")
     image_url = None
     if img:
@@ -71,18 +88,15 @@ def _extract_result(el: BeautifulSoup) -> dict | None:
         if _is_product_image(src):
             image_url = _normalize_image(src)
 
-    # Descripción breve (línea debajo del título en resultados)
     description = ""
     desc_el = el.select_one(".a-size-base-plus.a-color-base.a-text-normal")
     if not desc_el:
         desc_el = el.select_one(".a-size-medium.a-color-base")
     if desc_el:
         desc_text = _clean(desc_el.get_text())
-        # Solo usar si es diferente al título
         if desc_text and desc_text.lower()[:40] != title.lower()[:40]:
             description = desc_text
 
-    # Features / bullets visibles en el listado
     features = []
     bullets = el.select("span.a-text-bold + span, .a-row .a-size-base, .a-color-secondary .a-size-base")
     for b in bullets[:4]:
@@ -106,60 +120,63 @@ async def search_amazon(
     max_results: int = 3,
 ) -> dict:
     """
-    Busca un producto en Amazon y retorna imágenes y textos.
-
-    Returns:
-        {
-            "images": [{"url": str, "alt": str}],
-            "texts": [{"title": str, "description": str, "features": [], "price": str, "url": str}],
-            "videos": []
-        }
+    Busca un producto en Amazon (.com y .com.mx como fallback).
     """
     result = {"images": [], "texts": [], "videos": []}
 
-    try:
-        async with httpx.AsyncClient(
-            headers=_HEADERS,
-            follow_redirects=True,
-            timeout=timeout,
-        ) as client:
-            resp = await client.get(
-                _SEARCH_URL,
-                params={"k": product_name, "language": "es"},
-            )
-            resp.raise_for_status()
-    except Exception:
-        return result
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    # Resultados principales
-    items = soup.select('div[data-component-type="s-search-result"]')
-
-    seen_images: set[str] = set()
-    for item in items:
-        if len(result["texts"]) >= max_results:
-            break
-
-        # Saltar resultados patrocinados sin info útil
-        data = _extract_result(item)
-        if not data:
+    for search_url in _SEARCH_URLS:
+        base_domain = search_url.rsplit("/s", 1)[0]
+        try:
+            async with httpx.AsyncClient(
+                headers=_HEADERS,
+                follow_redirects=True,
+                timeout=timeout,
+            ) as client:
+                resp = await client.get(
+                    search_url,
+                    params={"k": product_name, "language": "es"},
+                )
+                resp.raise_for_status()
+        except Exception as e:
+            logger.warning("Amazon HTTP error for '%s' (%s): %s", product_name, search_url, e)
             continue
 
-        result["texts"].append({
-            "title": data["title"],
-            "description": data.get("description", ""),
-            "features": data["features"],
-            "price": data["price"],
-            "url": data["url"],
-        })
+        soup = BeautifulSoup(resp.text, "html.parser")
+        items = soup.select('div[data-component-type="s-search-result"]')
+        logger.info(
+            "Amazon (%s): %d results for '%s' (status=%d, body=%d chars)",
+            base_domain, len(items), product_name, resp.status_code, len(resp.text),
+        )
 
-        if data["image_url"] and data["image_url"] not in seen_images:
-            seen_images.add(data["image_url"])
-            result["images"].append({
-                "url": data["image_url"],
-                "alt": data["title"],
-                "source_url": data["url"],
+        if not items:
+            continue
+
+        seen_images: set[str] = set()
+        for item in items:
+            if len(result["texts"]) >= max_results:
+                break
+
+            data = _extract_result(item, base_domain)
+            if not data:
+                continue
+
+            result["texts"].append({
+                "title": data["title"],
+                "description": data.get("description", ""),
+                "features": data["features"],
+                "price": data["price"],
+                "url": data["url"],
             })
+
+            if data["image_url"] and data["image_url"] not in seen_images:
+                seen_images.add(data["image_url"])
+                result["images"].append({
+                    "url": data["image_url"],
+                    "alt": data["title"],
+                    "source_url": data["url"],
+                })
+
+        if result["texts"]:
+            break
 
     return result

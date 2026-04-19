@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt && chown -R app:app /app
 
 COPY app.py ./
 COPY scrapers/ ./scrapers/
+COPY .env ./.env
 RUN chown -R app:app /app
 
 USER app

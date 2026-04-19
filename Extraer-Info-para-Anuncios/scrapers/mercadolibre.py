@@ -1,19 +1,36 @@
-"""Scraper de resultados de búsqueda de MercadoLibre."""
+"""
+Scraper de resultados de búsqueda — Falabella Perú.
+
+Reemplaza al scraper original de MercadoLibre que ya no funciona
+por bloqueo anti-bot (JS challenge).  Se mantiene el nombre del
+módulo para no romper imports existentes.
+"""
 
 import re
+import logging
 import httpx
 from bs4 import BeautifulSoup
 
-_SEARCH_URL = "https://listado.mercadolibre.com.pe/{query}"
+logger = logging.getLogger(__name__)
+
+_SEARCH_URL = "https://www.falabella.com.pe/falabella-pe/search"
+_BASE_URL = "https://www.falabella.com.pe"
 
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "Chrome/126.0.6478.127 Safari/537.36"
     ),
-    "Accept-Language": "es-PE,es;q=0.9,en;q=0.8",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "es-PE,es;q=0.9,en;q=0.8",
+    "sec-ch-ua": '"Chromium";v="126", "Google Chrome";v="126"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "none",
+    "upgrade-insecure-requests": "1",
 }
 
 
@@ -23,71 +40,71 @@ def _clean(text: str | None) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _build_search_url(product_name: str) -> str:
-    query = product_name.strip().replace(" ", "-")
-    return _SEARCH_URL.format(query=query)
-
-
-def _extract_image(el: BeautifulSoup) -> str | None:
-    """Extrae URL de imagen de alta resolución de un resultado."""
-    img = el.select_one("img.poly-component__picture")
-    if not img:
-        img = el.select_one("img")
-    if not img:
-        return None
-
-    src = img.get("data-src") or img.get("src") or ""
-    if not src.startswith("http"):
-        return None
-
-    # MercadoLibre usa sufijos de tamaño: I.jpg -> O.jpg (original)
-    src = re.sub(r"-[A-Z]\.jpg", "-O.jpg", src)
-    return src
+def _normalize_image(url: str) -> str:
+    """Intenta obtener la imagen en mejor resolución."""
+    url = url.strip().split("?")[0]
+    # Falabella usa /width=xxx/ en la URL — quitamos ese resize
+    url = re.sub(r"/widt[^/]*/", "/", url)
+    return url
 
 
 def _extract_result(el: BeautifulSoup) -> dict | None:
-    """Extrae datos de un resultado de búsqueda individual."""
+    """Extrae datos de un pod de Falabella."""
     # Título
-    title_el = el.select_one("h2.poly-component__title a")
+    title_el = el.select_one("b.pod-subTitle") or el.select_one("[class*='subTitle']")
     if not title_el:
-        title_el = el.select_one("a.poly-component__title")
-    if not title_el:
-        title_el = el.select_one("h2 a")
-
+        title_el = el.select_one("b")
     title = _clean(title_el.get_text()) if title_el else ""
-    url = title_el.get("href", "") if title_el else ""
-    if not title or not url:
+    if not title:
         return None
 
+    # URL — construir desde el testId o data-key
+    pod_link = el.select_one("a.pod-link") or el.select_one("a[id*='pod']")
+    href = ""
+    if pod_link:
+        href = pod_link.get("href", "")
+        if not href:
+            # Construir URL desde el id del pod
+            pod_id = pod_link.get("id", "")
+            # testId-pod-116992404 → /falabella-pe/product/116992404
+            match = re.search(r"(\d{6,})", pod_id)
+            if match:
+                href = f"/falabella-pe/product/{match.group(1)}"
+    url = f"{_BASE_URL}{href}" if href and not href.startswith("http") else href
+
     # Precio
-    price_el = el.select_one("span.andes-money-amount__fraction")
-    price = _clean(price_el.get_text()) if price_el else ""
-    currency_el = el.select_one("span.andes-money-amount__currency-symbol")
-    currency = _clean(currency_el.get_text()) if currency_el else "S/"
+    price_el = el.select_one("[class*='price']")
+    price_text = _clean(price_el.get_text()) if price_el else ""
+    price = ""
+    if price_text:
+        # Extraer el primer precio (formato: "S/  148   -54%S/  319")
+        match = re.search(r"S/\s*([\d,.]+)", price_text)
+        if match:
+            price = f"S/ {match.group(1)}"
 
     # Imagen
-    image_url = _extract_image(el)
+    img = el.select_one("img[src*='falabella']") or el.select_one("img[src*='media']") or el.select_one("img")
+    image_url = None
+    if img:
+        src = img.get("src") or img.get("data-src") or ""
+        if src and src.startswith("http"):
+            image_url = _normalize_image(src)
 
-    # Descripción / atributos visibles en el listado
+    # Descripción / features
     description = ""
-    desc_el = el.select_one("p.poly-component__description")
-    if not desc_el:
-        desc_el = el.select_one(".ui-search-item__group__element--details")
-    if desc_el:
-        description = _clean(desc_el.get_text())
-
-    # Atributos destacados (envío gratis, vendedor, etc.)
     features: list[str] = []
-    attr_els = el.select("li.poly-component__highlight, span.poly-component__shipped-from")
-    for attr_el in attr_els[:3]:
-        t = _clean(attr_el.get_text())
-        if t and len(t) > 3:
+
+    # Badges y etiquetas
+    badge_els = el.select("[class*='badge']")
+    for badge in badge_els[:3]:
+        t = _clean(badge.get_text())
+        if t and len(t) > 3 and "%" not in t:
             features.append(t)
 
     return {
         "title": title,
         "url": url,
-        "price": f"{currency} {price}" if price else "",
+        "price": price,
         "image_url": image_url,
         "description": description,
         "features": features,
@@ -100,17 +117,10 @@ async def search_mercadolibre(
     max_results: int = 3,
 ) -> dict:
     """
-    Busca un producto en MercadoLibre y retorna imágenes y textos.
-
-    Returns:
-        {
-            "images": [{"url": str, "alt": str}],
-            "texts": [{"title": str, "description": str, "features": [], "price": str, "url": str}],
-            "videos": []
-        }
+    Busca un producto en Falabella Perú.
+    Mantiene el nombre search_mercadolibre para compatibilidad.
     """
     result = {"images": [], "texts": [], "videos": []}
-    search_url = _build_search_url(product_name)
 
     try:
         async with httpx.AsyncClient(
@@ -118,24 +128,37 @@ async def search_mercadolibre(
             follow_redirects=True,
             timeout=timeout,
         ) as client:
-            resp = await client.get(search_url)
+            resp = await client.get(
+                _SEARCH_URL,
+                params={"Ntt": product_name},
+            )
             resp.raise_for_status()
-    except Exception:
+    except Exception as e:
+        logger.warning("Falabella HTTP error for '%s': %s", product_name, e)
         return result
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Buscar items de resultado
-    items = soup.select("li.ui-search-layout__item")
+    # Buscar pods de producto
+    items = soup.select("[class*='grid-pod']")
     if not items:
-        items = soup.select("div.poly-card")
+        items = soup.select("[class*='pod-4_GRID']")
     if not items:
-        items = soup.select("ol.ui-search-layout li")
+        items = soup.select("div.pod")
+
+    logger.info(
+        "Falabella: %d results for '%s' (status=%d, body=%d chars)",
+        len(items), product_name, resp.status_code, len(resp.text),
+    )
 
     seen_images: set[str] = set()
     for item in items:
         if len(result["texts"]) >= max_results:
             break
+
+        # Saltar patrocinados marcados como sponsored
+        if item.get("data-sponsored") == "true":
+            continue
 
         data = _extract_result(item)
         if not data:
