@@ -92,14 +92,26 @@ def _extract_result(el: BeautifulSoup) -> dict | None:
         if _is_product_image(src):
             image_url = _normalize_image(src)
 
+    # Descripción: intentar múltiples selectores
     description = ""
-    desc_el = el.select_one(".a-size-base-plus.a-color-base.a-text-normal")
-    if not desc_el:
-        desc_el = el.select_one(".a-size-medium.a-color-base")
-    if desc_el:
-        desc_text = _clean(desc_el.get_text())
-        if desc_text and desc_text.lower()[:40] != title.lower()[:40]:
-            description = desc_text
+    desc_selectors = [
+        ".a-size-base-plus.a-color-base.a-text-normal",
+        ".a-size-medium.a-color-base.a-text-normal",
+        ".a-size-medium.a-color-base",
+        ".a-size-base.a-color-base",
+        ".a-text-normal",
+    ]
+    for sel in desc_selectors:
+        desc_el = el.select_one(sel)
+        if desc_el:
+            desc_text = _clean(desc_el.get_text())
+            if desc_text and len(desc_text) > 10:
+                description = desc_text
+                break
+
+    # Si no se encontró descripción separada, usar el título como descripción
+    if not description:
+        description = title
 
     features = []
     bullets = el.select("span.a-text-bold + span, .a-row .a-size-base, .a-color-secondary .a-size-base")

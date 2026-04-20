@@ -90,8 +90,26 @@ def _extract_result(el: BeautifulSoup) -> dict | None:
         if src and src.startswith("http"):
             image_url = _normalize_image(src)
 
-    # Descripción / features
+    # Descripción: intentar extraer texto descriptivo del pod
     description = ""
+    desc_selectors = [
+        "[class*='pod-details']",
+        "[class*='description']",
+        "[class*='brandName']",
+        "[class*='pod-body']",
+    ]
+    for sel in desc_selectors:
+        desc_el = el.select_one(sel)
+        if desc_el:
+            desc_text = _clean(desc_el.get_text())
+            if desc_text and len(desc_text) > 5:
+                description = desc_text
+                break
+
+    # Si no se encontró descripción, usar el título
+    if not description:
+        description = title
+
     features: list[str] = []
 
     # Badges y etiquetas
