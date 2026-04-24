@@ -1,6 +1,6 @@
 """
 Extraer-Info-para-Anuncios — Servicio VPS para enriquecer anuncios
-con contenido externo de Amazon, MercadoLibre y Alibaba,
+con contenido externo de Amazon, Alibaba y MercadoLibre,
 y generar preguntas frecuentes con OpenAI.
 """
 
@@ -39,6 +39,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 class ProductInput(BaseModel):
     id: int
     name: str
+    description: str = ""
 
 
 class EnrichRequest(BaseModel):
@@ -76,8 +77,6 @@ async def enrich(req: EnrichRequest):
     scrape_tasks = [_scrape_product(p.id, p.name) for p in products]
     scrape_results = await asyncio.gather(*scrape_tasks, return_exceptions=True)
 
-    # Recopilar textos scrapeados para contexto del Q&A
-    scraped_context_by_product: dict[int, list[dict]] = {}
     for res in scrape_results:
         if isinstance(res, Exception):
             logger.warning("Scrape error: %s", res)
@@ -85,13 +84,10 @@ async def enrich(req: EnrichRequest):
         all_images.extend(res["images"])
         all_videos.extend(res["videos"])
         all_texts.extend(res["texts"])
-        for txt in res["texts"]:
-            pid = txt["product_id"]
-            scraped_context_by_product.setdefault(pid, []).append(txt)
 
-    # Generar Q&A con OpenAI en paralelo por producto
+    # Generar Q&A con OpenAI en paralelo por producto (usando descripción del negocio)
     qa_tasks = [
-        _generate_qa(p.id, p.name, scraped_context_by_product.get(p.id, []))
+        _generate_qa(p.id, p.name, p.description)
         for p in products
     ]
     qa_results = await asyncio.gather(*qa_tasks, return_exceptions=True)
@@ -114,28 +110,29 @@ async def enrich(req: EnrichRequest):
 # ── Scraping ─────────────────────────────────────────────────
 
 async def _scrape_product(product_id: int, product_name: str) -> dict:
-    """Busca un producto en las 3 fuentes en paralelo y retorna max 3 de cada tipo."""
+    """Busca un producto en las 3 fuentes en paralelo y retorna max 3 de cada tipo.
+    Prioridad: Amazon > Alibaba > MercadoLibre."""
     logger.info("Scraping product %d: %s", product_id, product_name)
 
-    ml_task = search_mercadolibre(
-        product_name, timeout=SCRAPE_TIMEOUT, max_results=MAX_RESULTS_PER_SOURCE
-    )
     amz_task = search_amazon(
         product_name, timeout=SCRAPE_TIMEOUT, max_results=MAX_RESULTS_PER_SOURCE
     )
     ali_task = search_alibaba(
         product_name, timeout=SCRAPE_TIMEOUT, max_results=MAX_RESULTS_PER_SOURCE
     )
+    ml_task = search_mercadolibre(
+        product_name, timeout=SCRAPE_TIMEOUT, max_results=MAX_RESULTS_PER_SOURCE
+    )
 
-    ml_res, amz_res, ali_res = await asyncio.gather(
-        ml_task, amz_task, ali_task, return_exceptions=True
+    amz_res, ali_res, ml_res = await asyncio.gather(
+        amz_task, ali_task, ml_task, return_exceptions=True
     )
 
     raw_images: list[dict] = []
     raw_videos: list[dict] = []
     raw_texts: list[dict] = []
 
-    for source_name, res in [("falabella", ml_res), ("amazon", amz_res), ("amazon_mx", ali_res)]:
+    for source_name, res in [("amazon", amz_res), ("alibaba", ali_res), ("mercadolibre", ml_res)]:
         if isinstance(res, Exception):
             logger.warning("Error scraping %s for '%s': %s", source_name, product_name, res)
             continue
@@ -203,41 +200,41 @@ def _dedup_by_key(items: list[dict], key: str, limit: int) -> list[dict]:
 async def _generate_qa(
     product_id: int,
     product_name: str,
-    scraped_texts: list[dict],
+    product_description: str,
 ) -> list[dict]:
     """
     Genera 3 preguntas y respuestas frecuentes para un producto
-    usando OpenAI, basándose en la info scrapeada como contexto.
+    usando OpenAI, basándose en el nombre y descripción propios del negocio.
+    Si la descripción es corta o vacía, GPT genera preguntas genéricas.
     Retorna lista de dicts con product_id, question, answer.
     """
     if not OPENAI_API_KEY:
         logger.warning("OPENAI_API_KEY no configurada, omitiendo Q&A")
         return []
 
-    # Construir contexto con la info scrapeada
-    context_parts: list[str] = []
-    for txt in scraped_texts[:3]:
-        part = f"- {txt['title']}"
-        if txt.get("description"):
-            part += f": {txt['description']}"
-        if txt.get("features"):
-            part += f" ({', '.join(txt['features'][:3])})"
-        context_parts.append(part)
+    desc = (product_description or "").strip()
+    has_description = len(desc) > 20
 
-    context = "\n".join(context_parts) if context_parts else "No hay información adicional."
+    if has_description:
+        context_block = f"""Descripción del producto proporcionada por el negocio:
+{desc}"""
+        extra_rule = "- Basa las preguntas y respuestas en la descripción proporcionada por el negocio"
+    else:
+        context_block = "No se proporcionó descripción detallada del producto."
+        extra_rule = "- Como no hay descripción detallada, genera preguntas genéricas pero útiles para un comprador potencial de este tipo de producto"
 
     prompt = f"""Genera exactamente 3 preguntas frecuentes con sus respuestas sobre el producto "{product_name}".
 
-Información de referencia encontrada en tiendas online:
-{context}
+{context_block}
 
 REGLAS:
 - Cada pregunta DEBE empezar con un emoji relevante al tema de la pregunta
 - Las preguntas deben ser útiles para un comprador potencial
-- Las respuestas deben ser informativas, concisas (2-3 oraciones) y en español neutro
+- Las respuestas deben ser informativas, concisas (2-5 oraciones), simpáticas(usa emojis) y en español neutro
 - Temas sugeridos: características principales, usos/beneficios, compatibilidad o cuidados
+{extra_rule}
 - NO mencionar precios ni tiendas específicas
-- NO inventar especificaciones técnicas exactas que no estén en el contexto
+- NO inventar especificaciones técnicas exactas que no estén en la descripción
 
 Responde SOLO con un JSON array de 3 objetos, sin markdown ni texto adicional:
 [

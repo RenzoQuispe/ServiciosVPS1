@@ -1,11 +1,4 @@
-"""
-Scraper de resultados de búsqueda — Amazon México (.com.mx).
-
-Reemplaza al scraper original de Alibaba que ya no funciona
-(contenido renderizado por JavaScript, no disponible en HTML estático).
-Se mantiene el nombre del módulo para no romper imports existentes.
-Usa Amazon México como fuente alternativa de productos en español.
-"""
+"""Scraper de resultados de búsqueda de Alibaba.com."""
 
 import re
 import logging
@@ -14,7 +7,8 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-_SEARCH_URL = "https://www.amazon.com.mx/s"
+_SEARCH_URL = "https://www.alibaba.com/trade/search"
+_BASE_URL = "https://www.alibaba.com"
 
 _HEADERS = {
     "User-Agent": (
@@ -23,7 +17,7 @@ _HEADERS = {
         "Chrome/126.0.6478.127 Safari/537.36"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "es-MX,es;q=0.9,en;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9,es;q=0.8",
     "Accept-Encoding": "gzip, deflate, br",
     "sec-ch-ua": '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="99"',
     "sec-ch-ua-mobile": "?0",
@@ -43,81 +37,93 @@ def _clean(text: str | None) -> str:
 
 
 def _normalize_image(url: str) -> str:
-    """Convierte thumbnail de Amazon a alta resolución."""
+    """Convierte thumbnail de Alibaba a mejor resolución."""
     url = url.strip().split("?")[0]
-    url = re.sub(r"\._[^./]+_\.", ".", url)
+    # Alibaba usa _50x50.jpg o _220x220.jpg — intentar quitar el resize
+    url = re.sub(r"_\d+x\d+\.", ".", url)
+    if url.startswith("//"):
+        url = "https:" + url
     return url
 
 
 def _is_product_image(url: str) -> bool:
     low = url.lower()
-    if not low.startswith("http"):
+    if not any(low.startswith(p) for p in ["http", "//"]):
         return False
-    if any(x in low for x in ["sprite", "icon", "nav", "logo", "pixel", "transparent"]):
+    if any(x in low for x in ["sprite", "icon", "nav", "logo", "pixel", "transparent", "svg"]):
         return False
-    return "images" in low or "m.media-amazon" in low
+    return True
 
 
 def _extract_result(el: BeautifulSoup) -> dict | None:
-    """Extrae datos de un resultado de búsqueda de Amazon México."""
-    title_el = el.select_one("h2 a span") or el.select_one("h2 span")
-    title = _clean(title_el.get_text()) if title_el else ""
+    """Extrae datos de un resultado de búsqueda de Alibaba."""
+    # Título: buscar en múltiples selectores comunes de Alibaba
+    title_el = (
+        el.select_one("h2.search-card-e-title a")
+        or el.select_one("[class*='title'] a")
+        or el.select_one("h2 a")
+        or el.select_one("a[title]")
+    )
+    title = ""
+    href = ""
+    if title_el:
+        title = _clean(title_el.get("title") or title_el.get_text())
+        href = title_el.get("href", "")
     if not title:
         return None
 
-    # URL: intentar h2 a, luego links con /dp/, luego construir desde data-asin
-    link = el.select_one("h2 a")
-    href = link.get("href", "") if link else ""
-    if not href:
-        dp_link = el.select_one('a[href*="/dp/"]')
-        href = dp_link.get("href", "") if dp_link else ""
-    if not href:
-        asin = el.get("data-asin", "")
-        if asin:
-            href = f"/dp/{asin}"
-    url = f"https://www.amazon.com.mx{href}" if href.startswith("/") else href
+    # URL
+    if href and not href.startswith("http"):
+        if href.startswith("//"):
+            href = "https:" + href
+        elif href.startswith("/"):
+            href = _BASE_URL + href
+    url = href
 
-    price_whole = el.select_one("span.a-price-whole")
-    price_frac = el.select_one("span.a-price-fraction")
+    # Precio
     price = ""
-    if price_whole:
-        whole = _clean(price_whole.get_text()).rstrip(".")
-        frac = _clean(price_frac.get_text()) if price_frac else "00"
-        price = f"MX${whole}.{frac}"
+    price_el = (
+        el.select_one("[class*='price']")
+        or el.select_one("[class*='Price']")
+    )
+    if price_el:
+        price_text = _clean(price_el.get_text())
+        # Extraer precio en formato US$ o $
+        match = re.search(r"\$\s*([\d,.]+)", price_text)
+        if match:
+            price = f"US${match.group(1)}"
 
-    img = el.select_one("img.s-image")
+    # Imagen
     image_url = None
+    img = el.select_one("img[src], img[data-src]")
     if img:
-        src = img.get("src", "")
-        if _is_product_image(src):
+        src = img.get("src") or img.get("data-src") or ""
+        if src and _is_product_image(src):
             image_url = _normalize_image(src)
 
-    # Descripción: intentar múltiples selectores
+    # Descripción
     description = ""
     desc_selectors = [
-        ".a-size-base-plus.a-color-base.a-text-normal",
-        ".a-size-medium.a-color-base.a-text-normal",
-        ".a-size-medium.a-color-base",
-        ".a-size-base.a-color-base",
-        ".a-text-normal",
+        "[class*='description']",
+        "[class*='attr']",
+        "[class*='info']",
     ]
     for sel in desc_selectors:
         desc_el = el.select_one(sel)
         if desc_el:
             desc_text = _clean(desc_el.get_text())
-            if desc_text and len(desc_text) > 10:
+            if desc_text and len(desc_text) > 10 and desc_text != title:
                 description = desc_text
                 break
-
-    # Si no se encontró descripción separada, usar el título como descripción
     if not description:
         description = title
 
-    features = []
-    bullets = el.select("span.a-text-bold + span, .a-row .a-size-base, .a-color-secondary .a-size-base")
-    for b in bullets[:4]:
-        t = _clean(b.get_text())
-        if t and len(t) > 5 and t.lower() != title.lower()[:len(t)]:
+    # Features
+    features: list[str] = []
+    tag_els = el.select("[class*='tag'], [class*='attr'] span")
+    for tag in tag_els[:4]:
+        t = _clean(tag.get_text())
+        if t and len(t) > 3 and t.lower() != title.lower()[:len(t)]:
             features.append(t)
 
     return {
@@ -135,10 +141,7 @@ async def search_alibaba(
     timeout: float = 15.0,
     max_results: int = 3,
 ) -> dict:
-    """
-    Busca un producto en Amazon México.
-    Mantiene el nombre search_alibaba para compatibilidad.
-    """
+    """Busca un producto en Alibaba.com."""
     result = {"images": [], "texts": [], "videos": []}
 
     try:
@@ -149,18 +152,27 @@ async def search_alibaba(
         ) as client:
             resp = await client.get(
                 _SEARCH_URL,
-                params={"k": product_name},
+                params={"SearchText": product_name},
             )
             resp.raise_for_status()
     except Exception as e:
-        logger.warning("Amazon MX HTTP error for '%s': %s", product_name, e)
+        logger.warning("Alibaba HTTP error for '%s': %s", product_name, e)
         return result
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    items = soup.select('div[data-component-type="s-search-result"]')
+    # Selectores para los cards de producto de Alibaba
+    items = soup.select("[class*='organic-list'] [class*='list-card']")
+    if not items:
+        items = soup.select("[class*='search-card-e']")
+    if not items:
+        items = soup.select("[class*='J-offer-wrapper']")
+    if not items:
+        # Fallback genérico: cualquier div con data-content
+        items = soup.select("div[data-content]")
+
     logger.info(
-        "Amazon MX: %d results for '%s' (status=%d, body=%d chars)",
+        "Alibaba: %d results for '%s' (status=%d, body=%d chars)",
         len(items), product_name, resp.status_code, len(resp.text),
     )
 

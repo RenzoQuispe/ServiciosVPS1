@@ -1,4 +1,4 @@
-"""Scraper de resultados de búsqueda de Amazon (.com y .com.mx)."""
+"""Scraper de resultados de búsqueda de Amazon (.com)."""
 
 import re
 import logging
@@ -7,10 +7,8 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-_SEARCH_URLS = [
-    "https://www.amazon.com/s",
-    "https://www.amazon.com.mx/s",
-]
+_SEARCH_URL = "https://www.amazon.com/s"
+_BASE_DOMAIN = "https://www.amazon.com"
 
 _HEADERS = {
     "User-Agent": (
@@ -131,64 +129,54 @@ async def search_amazon(
     timeout: float = 15.0,
     max_results: int = 3,
 ) -> dict:
-    """
-    Busca un producto en Amazon (.com y .com.mx como fallback).
-    """
+    """Busca un producto en Amazon.com."""
     result = {"images": [], "texts": [], "videos": []}
 
-    for search_url in _SEARCH_URLS:
-        base_domain = search_url.rsplit("/s", 1)[0]
-        try:
-            async with httpx.AsyncClient(
-                headers=_HEADERS,
-                follow_redirects=True,
-                timeout=timeout,
-            ) as client:
-                resp = await client.get(
-                    search_url,
-                    params={"k": product_name, "language": "es"},
-                )
-                resp.raise_for_status()
-        except Exception as e:
-            logger.warning("Amazon HTTP error for '%s' (%s): %s", product_name, search_url, e)
-            continue
+    try:
+        async with httpx.AsyncClient(
+            headers=_HEADERS,
+            follow_redirects=True,
+            timeout=timeout,
+        ) as client:
+            resp = await client.get(
+                _SEARCH_URL,
+                params={"k": product_name, "language": "es"},
+            )
+            resp.raise_for_status()
+    except Exception as e:
+        logger.warning("Amazon HTTP error for '%s': %s", product_name, e)
+        return result
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        items = soup.select('div[data-component-type="s-search-result"]')
-        logger.info(
-            "Amazon (%s): %d results for '%s' (status=%d, body=%d chars)",
-            base_domain, len(items), product_name, resp.status_code, len(resp.text),
-        )
+    soup = BeautifulSoup(resp.text, "html.parser")
+    items = soup.select('div[data-component-type="s-search-result"]')
+    logger.info(
+        "Amazon: %d results for '%s' (status=%d, body=%d chars)",
+        len(items), product_name, resp.status_code, len(resp.text),
+    )
 
-        if not items:
-            continue
-
-        seen_images: set[str] = set()
-        for item in items:
-            if len(result["texts"]) >= max_results:
-                break
-
-            data = _extract_result(item, base_domain)
-            if not data:
-                continue
-
-            result["texts"].append({
-                "title": data["title"],
-                "description": data.get("description", ""),
-                "features": data["features"],
-                "price": data["price"],
-                "url": data["url"],
-            })
-
-            if data["image_url"] and data["image_url"] not in seen_images:
-                seen_images.add(data["image_url"])
-                result["images"].append({
-                    "url": data["image_url"],
-                    "alt": data["title"],
-                    "source_url": data["url"],
-                })
-
-        if result["texts"]:
+    seen_images: set[str] = set()
+    for item in items:
+        if len(result["texts"]) >= max_results:
             break
+
+        data = _extract_result(item, _BASE_DOMAIN)
+        if not data:
+            continue
+
+        result["texts"].append({
+            "title": data["title"],
+            "description": data.get("description", ""),
+            "features": data["features"],
+            "price": data["price"],
+            "url": data["url"],
+        })
+
+        if data["image_url"] and data["image_url"] not in seen_images:
+            seen_images.add(data["image_url"])
+            result["images"].append({
+                "url": data["image_url"],
+                "alt": data["title"],
+                "source_url": data["url"],
+            })
 
     return result
